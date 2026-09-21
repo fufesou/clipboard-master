@@ -29,6 +29,7 @@ fn bind_version<I: Proxy>(advertised_version: u32) -> u32 {
 #[derive(Debug)]
 pub(crate) struct ClipBoardListenMessage {
     pub _mime_types: Vec<String>,
+    pub is_initial: bool,
 }
 
 enum DataControlManager {
@@ -52,6 +53,10 @@ pub(crate) struct WlClipboardListener {
     queue: Option<Arc<Mutex<EventQueue<Self>>>>,
     exit_flag: Arc<AtomicBool>,
     copied: bool,
+    // The first selection event is the existing state, even when its offer is null.
+    selection_received: bool,
+    // A later selection in the same dispatch batch must be reported as a live change.
+    initial_selection: bool,
 }
 
 impl WlClipboardListener {
@@ -78,6 +83,8 @@ impl WlClipboardListener {
             queue: None,
             exit_flag,
             copied: false,
+            selection_received: false,
+            initial_selection: false,
         };
         event_queue.blocking_dispatch(&mut state).map_err(|e| {
             io::Error::new(io::ErrorKind::Other, format!("Inital dispatch failed: {e}"))
@@ -184,6 +191,7 @@ impl WlClipboardListener {
         }
         Ok(ClipBoardListenMessage {
             _mime_types: std::mem::take(&mut self.mime_types),
+            is_initial: self.initial_selection,
         })
     }
 }
@@ -312,11 +320,13 @@ impl Dispatch<ext_data_control_device_v1::ExtDataControlDeviceV1, ()> for WlClip
                 }
             }
             ext_data_control_device_v1::Event::Selection { id } => {
+                let initial = !std::mem::replace(&mut state.selection_received, true);
                 let Some(offer) = id else {
                     return;
                 };
                 offer.destroy();
                 state.copied = true;
+                state.initial_selection = initial;
             }
             _ => {}
         }
@@ -398,11 +408,13 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for WlCl
                 }
             }
             zwlr_data_control_device_v1::Event::Selection { id } => {
+                let initial = !std::mem::replace(&mut state.selection_received, true);
                 let Some(offer) = id else {
                     return;
                 };
                 offer.destroy();
                 state.copied = true;
+                state.initial_selection = initial;
             }
             _ => {
                 println!("unhandled event: {:?}", event);

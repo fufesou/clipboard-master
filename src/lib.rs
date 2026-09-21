@@ -51,6 +51,13 @@ pub use master::{Master, Shutdown};
 pub trait ClipboardHandler {
     ///Callback to call on clipboard change.
     fn on_clipboard_change(&mut self) -> CallbackResult;
+
+    ///Called when Wayland announces an existing selection at listener startup.
+    ///Defaults to a normal change notification for backwards compatibility.
+    fn on_clipboard_initial_selection(&mut self) -> CallbackResult {
+        self.on_clipboard_change()
+    }
+
     ///Callback to call on when error happens in master.
     fn on_clipboard_error(&mut self, error: io::Error) -> CallbackResult {
         CallbackResult::StopWithError(error)

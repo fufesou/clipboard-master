@@ -263,8 +263,8 @@ impl<H: ClipboardHandler> Master<H> {
                     if exit_flag.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
                     }
-                    match context {
-                        Ok(_) => {}
+                    let is_initial = match context {
+                        Ok(context) => context.is_initial,
                         Err(error) => {
                             let error = io::Error::new(
                                 io::ErrorKind::Other,
@@ -282,8 +282,13 @@ impl<H: ClipboardHandler> Master<H> {
                                 }
                             }
                         }
-                    }
-                    match self.handler.on_clipboard_change() {
+                    };
+                    let callback_result = if is_initial {
+                        self.handler.on_clipboard_initial_selection()
+                    } else {
+                        self.handler.on_clipboard_change()
+                    };
+                    match callback_result {
                         CallbackResult::StopWithError(error) => {
                             result = Err(WaylandRunError::Runtime(error));
                             break;
