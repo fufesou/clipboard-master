@@ -321,12 +321,12 @@ impl Dispatch<ext_data_control_device_v1::ExtDataControlDeviceV1, ()> for WlClip
             }
             ext_data_control_device_v1::Event::Selection { id } => {
                 let initial = !std::mem::replace(&mut state.selection_received, true);
+                state.initial_selection = initial;
                 let Some(offer) = id else {
                     return;
                 };
                 offer.destroy();
                 state.copied = true;
-                state.initial_selection = initial;
             }
             _ => {}
         }
@@ -409,12 +409,12 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for WlCl
             }
             zwlr_data_control_device_v1::Event::Selection { id } => {
                 let initial = !std::mem::replace(&mut state.selection_received, true);
+                state.initial_selection = initial;
                 let Some(offer) = id else {
                     return;
                 };
                 offer.destroy();
                 state.copied = true;
-                state.initial_selection = initial;
             }
             _ => {
                 println!("unhandled event: {:?}", event);
@@ -459,5 +459,60 @@ impl Dispatch<zwlr_data_control_offer_v1::ZwlrDataControlOfferV1, ()> for WlClip
         if let zwlr_data_control_offer_v1::Event::Offer { mime_type } = event {
             state.mime_types.push(mime_type);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+
+    fn assert_null_selection<I: Proxy>(event: fn() -> I::Event)
+    where
+        WlClipboardListener: Dispatch<I, ()>,
+    {
+        let (client, _server) = UnixStream::pair().expect("Create a Wayland socket pair");
+        let connection = Connection::from_socket(client).expect("Create a Wayland connection");
+        let queue = connection.new_event_queue::<WlClipboardListener>();
+        let device = I::inert(connection.backend().downgrade());
+        for copied in [false, true] {
+            // The startup offer's notification has either been consumed or is still pending.
+            let mut state = WlClipboardListener {
+                seat: None,
+                seat_name: None,
+                seat_name_supported: false,
+                data_manager: None,
+                data_device: None,
+                terminated_reason: None,
+                mime_types: Vec::new(),
+                queue: None,
+                exit_flag: Arc::new(AtomicBool::new(false)),
+                copied,
+                selection_received: true,
+                initial_selection: true,
+            };
+            <WlClipboardListener as Dispatch<I, ()>>::event(
+                &mut state,
+                &device,
+                event(),
+                &(),
+                &connection,
+                &queue.handle(),
+            );
+            assert_eq!(state.copied, copied);
+            assert!(!state.initial_selection);
+        }
+    }
+
+    #[test]
+    fn ext_null_selection_updates_pending_notification() {
+        use ext_data_control_device_v1::{Event, ExtDataControlDeviceV1};
+        assert_null_selection::<ExtDataControlDeviceV1>(|| Event::Selection { id: None });
+    }
+
+    #[test]
+    fn zwlr_null_selection_updates_pending_notification() {
+        use zwlr_data_control_device_v1::{Event, ZwlrDataControlDeviceV1};
+        assert_null_selection::<ZwlrDataControlDeviceV1>(|| Event::Selection { id: None });
     }
 }
