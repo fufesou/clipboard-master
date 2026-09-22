@@ -52,6 +52,11 @@ pub trait ClipboardHandler {
     ///Callback to call on clipboard change.
     fn on_clipboard_change(&mut self) -> CallbackResult;
 
+    ///Called once after the X11 or Wayland backend subscribes to clipboard changes,
+    ///even when the clipboard is empty, and before the first change callback.
+    ///Other backends do not emit this notification.
+    fn on_clipboard_ready(&mut self) {}
+
     ///Called when Wayland announces an existing selection at listener startup.
     ///Defaults to a normal change notification for backwards compatibility.
     ///This callback is not guaranteed on startup and is not a readiness signal.

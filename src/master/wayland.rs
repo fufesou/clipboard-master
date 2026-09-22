@@ -103,9 +103,24 @@ impl WlClipboardListener {
             }
         }
 
-        state.set_data_device(&qhandle);
+        state.initialize_data_device(&mut event_queue)?;
         state.queue = Some(Arc::new(Mutex::new(event_queue)));
         Ok(state)
+    }
+
+    fn initialize_data_device(&mut self, queue: &mut EventQueue<Self>) -> io::Result<()> {
+        self.set_data_device(&queue.handle());
+        // Consume the initial selection, including an empty one, before reporting readiness.
+        queue.roundtrip(self).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("Data device initialization failed: {e}"),
+            )
+        })?;
+        if let Some(reason) = self.terminated_reason.take() {
+            return Err(io::Error::new(io::ErrorKind::Other, reason));
+        }
+        Ok(())
     }
 
     fn device_ready(&self) -> bool {
@@ -148,6 +163,12 @@ impl WlClipboardListener {
                 ));
             }
 
+            // Initialization may already have dispatched a selection event.
+            if self.copied {
+                self.copied = false;
+                break;
+            }
+
             queue
                 .flush()
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Flush failed: {e}")))?;
@@ -166,10 +187,6 @@ impl WlClipboardListener {
                         })?;
                         if let Some(reason) = self.terminated_reason.take() {
                             return Err(io::Error::new(io::ErrorKind::Other, reason));
-                        }
-                        if self.copied {
-                            self.copied = false;
-                            break;
                         }
                     } else {
                         // https://docs.rs/wayland-backend/latest/wayland_backend/rs/client/struct.ReadEventsGuard.html#method.read

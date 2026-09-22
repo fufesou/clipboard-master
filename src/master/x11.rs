@@ -82,6 +82,7 @@ impl<H: ClipboardHandler> Master<H> {
         }
 
         let mut result = Ok(());
+        let mut ready_notified = false;
         'main: loop {
             let selection = clipboard.getter.atoms.clipboard;
 
@@ -151,6 +152,11 @@ impl<H: ClipboardHandler> Master<H> {
                     }
                 }
             };
+
+            if !ready_notified {
+                ready_notified = true;
+                self.handler.on_clipboard_ready();
+            }
 
             'poll: loop {
                 match clipboard.getter.connection.poll_for_event_with_sequence() {
@@ -259,6 +265,7 @@ impl<H: ClipboardHandler> Master<H> {
         use super::wayland::WlClipboardListener;
         match WlClipboardListener::init(exit_flag.clone()) {
             Ok(listener) => {
+                self.handler.on_clipboard_ready();
                 for context in listener.into_iter() {
                     if exit_flag.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
