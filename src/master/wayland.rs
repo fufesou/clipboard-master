@@ -467,7 +467,7 @@ mod tests {
     use super::*;
     use std::os::unix::net::UnixStream;
 
-    fn assert_null_selection<I: Proxy>(event: fn() -> I::Event)
+    fn assert_selection_batches<I: Proxy, O: Proxy>(event: fn(Option<O>) -> I::Event)
     where
         WlClipboardListener: Dispatch<I, ()>,
     {
@@ -475,8 +475,15 @@ mod tests {
         let connection = Connection::from_socket(client).expect("Create a Wayland connection");
         let queue = connection.new_event_queue::<WlClipboardListener>();
         let device = I::inert(connection.backend().downgrade());
-        for copied in [false, true] {
-            // The startup offer's notification has either been consumed or is still pending.
+        for (received, copied, offers, expected) in [
+            (false, false, &[true][..], Some(true)),
+            (false, false, &[false][..], None),
+            (false, false, &[false, true][..], Some(false)),
+            (false, false, &[true, true][..], Some(false)),
+            (false, false, &[true, false][..], Some(false)),
+            (true, true, &[false][..], Some(false)),
+            (true, false, &[false][..], None),
+        ] {
             let mut state = WlClipboardListener {
                 seat: None,
                 seat_name: None,
@@ -488,31 +495,44 @@ mod tests {
                 queue: None,
                 exit_flag: Arc::new(AtomicBool::new(false)),
                 copied,
-                selection_received: true,
-                initial_selection: true,
+                selection_received: received,
+                initial_selection: received,
             };
-            <WlClipboardListener as Dispatch<I, ()>>::event(
-                &mut state,
-                &device,
-                event(),
-                &(),
-                &connection,
-                &queue.handle(),
+            for &has_offer in offers {
+                let id = has_offer.then(|| O::inert(connection.backend().downgrade()));
+                <WlClipboardListener as Dispatch<I, ()>>::event(
+                    &mut state,
+                    &device,
+                    event(id),
+                    &(),
+                    &connection,
+                    &queue.handle(),
+                );
+            }
+            assert!(state.selection_received);
+            assert_eq!(
+                state.copied.then_some(state.initial_selection),
+                expected,
+                "received={received}, copied={copied}, offers={offers:?}",
             );
-            assert_eq!(state.copied, copied);
-            assert!(!state.initial_selection);
         }
     }
 
     #[test]
-    fn ext_null_selection_updates_pending_notification() {
+    fn ext_selection_batches_classify_startup() {
         use ext_data_control_device_v1::{Event, ExtDataControlDeviceV1};
-        assert_null_selection::<ExtDataControlDeviceV1>(|| Event::Selection { id: None });
+        use ext_data_control_offer_v1::ExtDataControlOfferV1;
+        assert_selection_batches::<ExtDataControlDeviceV1, ExtDataControlOfferV1>(|id| {
+            Event::Selection { id }
+        });
     }
 
     #[test]
-    fn zwlr_null_selection_updates_pending_notification() {
+    fn zwlr_selection_batches_classify_startup() {
         use zwlr_data_control_device_v1::{Event, ZwlrDataControlDeviceV1};
-        assert_null_selection::<ZwlrDataControlDeviceV1>(|| Event::Selection { id: None });
+        use zwlr_data_control_offer_v1::ZwlrDataControlOfferV1;
+        assert_selection_batches::<ZwlrDataControlDeviceV1, ZwlrDataControlOfferV1>(|id| {
+            Event::Selection { id }
+        });
     }
 }
