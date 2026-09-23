@@ -307,6 +307,7 @@ impl<H: ClipboardHandler> Master<H> {
                     }
                 }
             }
+            Err(_) if exit_flag.load(std::sync::atomic::Ordering::Relaxed) => {}
             Err(error) => {
                 result = Err(WaylandRunError::Init(io::Error::new(io::ErrorKind::Other, error)));
             }

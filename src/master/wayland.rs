@@ -4,12 +4,13 @@
 use std::{
     io,
     sync::{atomic::AtomicBool, Arc, Mutex},
+    time::Duration,
 };
 use wayland_client::{
     backend::WaylandError,
     event_created_child,
     protocol::{wl_registry, wl_seat},
-    Connection, Dispatch, EventQueue, Proxy,
+    Connection, Dispatch, DispatchError, EventQueue, Proxy,
 };
 use wayland_protocols::ext::data_control::v1::client::{
     ext_data_control_device_v1, ext_data_control_manager_v1, ext_data_control_offer_v1,
@@ -21,6 +22,8 @@ use wayland_protocols_wlr::data_control::v1::client::{
 };
 
 const WL_SEAT_NAME_VERSION: u32 = 2;
+const INITIALIZATION_RETRY_INTERVAL: Duration = Duration::from_millis(30);
+const INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn bind_version<I: Proxy>(advertised_version: u32) -> u32 {
     advertised_version.min(I::interface().version)
@@ -110,17 +113,65 @@ impl WlClipboardListener {
 
     fn initialize_data_device(&mut self, queue: &mut EventQueue<Self>) -> io::Result<()> {
         self.set_data_device(&queue.handle());
-        // Consume the initial selection, including an empty one, before reporting readiness.
-        queue.roundtrip(self).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("Data device initialization failed: {e}"),
-            )
-        })?;
-        if let Some(reason) = self.terminated_reason.take() {
-            return Err(io::Error::new(io::ErrorKind::Other, reason));
+        // Both protocols send an initial selection, including an empty one, after binding.
+        self.wait_for_initial_selection(|state| {
+            let dispatched = queue.dispatch_pending(state)?;
+            if dispatched > 0 {
+                return Ok(dispatched);
+            }
+            match queue.flush() {
+                Ok(()) => {}
+                // Keep reading when the send buffer is full so the compositor can progress.
+                Err(WaylandError::Io(ref error)) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error.into()),
+            }
+            // This connection has no other readers during initialization.
+            if let Some(guard) = queue.prepare_read() {
+                guard.read()?;
+            }
+            queue.dispatch_pending(state)
+        })
+    }
+
+    fn wait_for_initial_selection(
+        &mut self,
+        mut dispatch: impl FnMut(&mut Self) -> Result<usize, DispatchError>,
+    ) -> io::Result<()> {
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(reason) = self.terminated_reason.take() {
+                return Err(io::Error::new(io::ErrorKind::Other, reason));
+            }
+            if self.exit_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "Data device initialization cancelled",
+                ));
+            }
+            if self.selection_received {
+                return Ok(());
+            }
+            if started.elapsed() >= INITIALIZATION_TIMEOUT {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Timed out waiting for the initial Wayland clipboard selection",
+                ));
+            }
+            match dispatch(self) {
+                Ok(0) => {}
+                Ok(_) => continue,
+                Err(error) => {
+                    let kind = match &error {
+                        DispatchError::Backend(WaylandError::Io(error)) => error.kind(),
+                        _ => io::ErrorKind::Other,
+                    };
+                    if kind != io::ErrorKind::WouldBlock {
+                        return Err(io::Error::new(kind, error));
+                    }
+                }
+            }
+            std::thread::sleep(INITIALIZATION_RETRY_INTERVAL);
         }
-        Ok(())
     }
 
     fn device_ready(&self) -> bool {
@@ -192,11 +243,11 @@ impl WlClipboardListener {
                         // https://docs.rs/wayland-backend/latest/wayland_backend/rs/client/struct.ReadEventsGuard.html#method.read
                         // It's wired that `read()` return `Ok(0)` if `winit` is in `Cargo.tomml`.
                         // https://github.com/rust-windowing/winit/issues/4380
-                        std::thread::sleep(std::time::Duration::from_millis(30));
+                        std::thread::sleep(Duration::from_millis(30));
                     }
                 }
                 Err(WaylandError::Io(ref e)) if e.kind() == io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(std::time::Duration::from_millis(30));
+                    std::thread::sleep(Duration::from_millis(30));
                 }
                 Err(e) => {
                     return Err(io::Error::new(
@@ -326,7 +377,9 @@ impl Dispatch<ext_data_control_device_v1::ExtDataControlDeviceV1, ()> for WlClip
             ext_data_control_device_v1::Event::DataOffer { id: _id } => {}
             ext_data_control_device_v1::Event::Finished => {
                 if let Some(DataControlDevice::Ext(device)) = state.data_device.take() {
-                    eprintln!("Wayland ext_data_control_v1 device finished; stopping clipboard listener");
+                    eprintln!(
+                        "Wayland ext_data_control_v1 device finished; stopping clipboard listener"
+                    );
                     device.destroy();
                 }
                 state.terminated_reason = Some("Wayland ext_data_control_v1 device finished");
@@ -414,7 +467,9 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for WlCl
             zwlr_data_control_device_v1::Event::DataOffer { id: _id } => {}
             zwlr_data_control_device_v1::Event::Finished => {
                 if let Some(DataControlDevice::Zwlr(device)) = state.data_device.take() {
-                    eprintln!("Wayland zwlr_data_control_v1 device finished; stopping clipboard listener");
+                    eprintln!(
+                        "Wayland zwlr_data_control_v1 device finished; stopping clipboard listener"
+                    );
                     device.destroy();
                 }
                 state.terminated_reason = Some("Wayland zwlr_data_control_v1 device finished");
@@ -482,7 +537,27 @@ impl Dispatch<zwlr_data_control_offer_v1::ZwlrDataControlOfferV1, ()> for WlClip
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
     use std::os::unix::net::UnixStream;
+
+    const TEST_GRACE_PERIOD: Duration = Duration::from_secs(2);
+
+    fn listener() -> WlClipboardListener {
+        WlClipboardListener {
+            seat: None,
+            seat_name: None,
+            seat_name_supported: false,
+            data_manager: None,
+            data_device: None,
+            terminated_reason: None,
+            mime_types: Vec::new(),
+            queue: None,
+            exit_flag: Arc::new(AtomicBool::new(false)),
+            copied: false,
+            selection_received: false,
+            initial_selection: false,
+        }
+    }
 
     fn assert_selection_batches<I: Proxy, O: Proxy>(event: fn(Option<O>) -> I::Event)
     where
@@ -501,20 +576,10 @@ mod tests {
             (true, true, &[false][..], Some(false)),
             (true, false, &[false][..], None),
         ] {
-            let mut state = WlClipboardListener {
-                seat: None,
-                seat_name: None,
-                seat_name_supported: false,
-                data_manager: None,
-                data_device: None,
-                terminated_reason: None,
-                mime_types: Vec::new(),
-                queue: None,
-                exit_flag: Arc::new(AtomicBool::new(false)),
-                copied,
-                selection_received: received,
-                initial_selection: received,
-            };
+            let mut state = listener();
+            state.copied = copied;
+            state.selection_received = received;
+            state.initial_selection = received;
             for &has_offer in offers {
                 let id = has_offer.then(|| O::inert(connection.backend().downgrade()));
                 <WlClipboardListener as Dispatch<I, ()>>::event(
@@ -551,5 +616,65 @@ mod tests {
         assert_selection_batches::<ZwlrDataControlDeviceV1, ZwlrDataControlOfferV1>(|id| {
             Event::Selection { id }
         });
+    }
+
+    fn assert_silent_peer_initialization(cancel: bool) {
+        const SEAT_GLOBAL: u32 = 1;
+        const MANAGER_GLOBAL: u32 = 2;
+        const PROTOCOL_VERSION: u32 = 1;
+        let (client, mut server) = UnixStream::pair().expect("Create a Wayland socket pair");
+        server
+            .set_read_timeout(Some(TEST_GRACE_PERIOD))
+            .expect("Bound the test server read");
+        let connection = Connection::from_socket(client).expect("Create a Wayland connection");
+        let mut queue = connection.new_event_queue::<WlClipboardListener>();
+        let handle = queue.handle();
+        let registry = connection.display().get_registry(&handle, ());
+        let mut state = listener();
+        state.seat = Some(registry.bind(SEAT_GLOBAL, PROTOCOL_VERSION, &handle, ()));
+        state.data_manager = Some(DataControlManager::Ext(registry.bind(
+            MANAGER_GLOBAL,
+            PROTOCOL_VERSION,
+            &handle,
+            (),
+        )));
+        let exit_flag = state.exit_flag.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender
+                .send(state.initialize_data_device(&mut queue))
+                .expect("Report the initialization result");
+        });
+        // Wait for a real request before signalling, while keeping the peer silent and open.
+        let request = server.read_exact(&mut [0]);
+        let wait = if cancel {
+            exit_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            TEST_GRACE_PERIOD
+        } else {
+            INITIALIZATION_TIMEOUT + TEST_GRACE_PERIOD
+        };
+        let result = receiver.recv_timeout(wait);
+        drop(server); // Release a regressed blocking read before joining the worker.
+        worker.join().expect("Join the initialization worker");
+        request.expect("Initialization must flush its requests");
+        let error = result
+            .expect("Initialization must finish with the peer still open")
+            .expect_err("A silent peer cannot establish readiness");
+        let expected = if cancel {
+            io::ErrorKind::Interrupted
+        } else {
+            io::ErrorKind::TimedOut
+        };
+        assert_eq!(error.kind(), expected);
+    }
+
+    #[test]
+    fn initialization_with_silent_peer_can_be_cancelled() {
+        assert_silent_peer_initialization(true);
+    }
+
+    #[test]
+    fn initialization_with_silent_peer_times_out() {
+        assert_silent_peer_initialization(false);
     }
 }
